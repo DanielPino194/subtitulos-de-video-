@@ -1,0 +1,6 @@
+{
+  "name": "LingaSync - Real-Time Video Translator",
+  "description": "Translate your camera and videos in real-time with AI-powered speech-to-speech and overlays.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["AI Translation", "Real-time Processing"]
+}
