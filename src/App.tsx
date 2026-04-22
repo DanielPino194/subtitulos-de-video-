@@ -46,10 +46,14 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaElementSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   
-  const [isMuted, setIsMuted] = useState(false);
-  const [audioLevel, setAudioLevel] = useState(0);
-  const analyserRef = useRef<AnalyserNode | null>(null);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
+  const [isAudioContextReady, setIsAudioContextReady] = useState(false);
   
+  const addLog = (msg: string) => {
+    setLogs(prev => [msg, ...prev].slice(0, 5));
+  };
+
   // --- Utilidades de Audio ---
   const float32ToInt16Base64 = (buffer: Float32Array) => {
     const int16Buffer = new Int16Array(buffer.length);
@@ -65,7 +69,8 @@ export default function App() {
     const file = e.target.files?.[0];
     if (file) {
       setSelectedFile(file);
-      setCurrentModelText("Video cargado. Presiona 'COMENZAR' para traducir.");
+      setCurrentModelText("Video cargado. Presiona 'CONECTAR' botón blanco abajo.");
+      addLog("Archivo cargado: " + file.name);
       if (videoRef.current) {
         const url = URL.createObjectURL(file);
         videoRef.current.srcObject = null; 
@@ -74,6 +79,26 @@ export default function App() {
         mediaElementSourceRef.current = null;
       }
     }
+  };
+
+  const initAudio = async () => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: SAMPLE_RATE
+      });
+    }
+    if (audioContextRef.current.state === 'suspended') {
+      await audioContextRef.current.resume();
+    }
+    setIsAudioContextReady(true);
+    // Play a tiny beep to unlock
+    const osc = audioContextRef.current.createOscillator();
+    const gain = audioContextRef.current.createGain();
+    gain.gain.value = 0.01;
+    osc.connect(gain);
+    gain.connect(audioContextRef.current.destination);
+    osc.start();
+    osc.stop(audioContextRef.current.currentTime + 0.1);
   };
 
   const stopSession = useCallback(() => {
@@ -91,10 +116,13 @@ export default function App() {
       videoRef.current.pause();
     }
     setAudioLevel(0);
+    setIsAiSpeaking(false);
+    addLog("Sesión terminada.");
   }, []);
 
   const startSession = async () => {
     try {
+      await initAudio();
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       
       let stream: MediaStream | null = null;
@@ -119,19 +147,11 @@ export default function App() {
       }
 
       if (sourceType === 'file' && videoRef.current) {
+        videoRef.current.currentTime = 0;
         await videoRef.current.play();
       }
 
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
-          sampleRate: SAMPLE_RATE
-        });
-      }
-      
-      const audioCtx = audioContextRef.current;
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
-      }
+      const audioCtx = audioContextRef.current!;
 
       const sessionPromise = ai.live.connect({
         model: "gemini-3.1-flash-live-preview",
@@ -140,30 +160,38 @@ export default function App() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Charon" } }
           },
-          systemInstruction: `Eres un traductor profesional EN VIVO. 
-          Traduce todo el audio que recibas al ${targetLang}.
-          Salida: Audio Traducido + Texto de la traducción.
-          Sé extremadamente rápido. Responde frase por frase.`,
+          systemInstruction: `Eres un traductor simultáneo profesional. 
+          Escucha lo que se dice en el audio y tradúcelo al ${targetLang}.
+          Responde INMEDIATAMENTE de forma hablada con la traducción.
+          Sé conciso. No expliques nada, solo traduce.`,
           outputAudioTranscription: {},
         },
         callbacks: {
           onopen: () => {
             setIsActive(true);
+            addLog("Conexión con IA abierta.");
             startAudioCapture(audioCtx, stream);
             startVideoCapture();
           },
           onmessage: async (message) => {
             if (message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data) {
+              setIsAiSpeaking(true);
               playBufferedAudio(message.serverContent.modelTurn.parts[0].inlineData.data);
+              setTimeout(() => setIsAiSpeaking(false), 2000);
             }
             const modelTranscription = message.serverContent?.modelTurn?.parts?.find(p => p.text)?.text;
             if (modelTranscription) {
                setCurrentModelText(modelTranscription);
+               addLog("Traducción: " + modelTranscription);
             }
           },
-          onclose: () => setIsActive(false),
+          onclose: () => {
+            setIsActive(false);
+            addLog("IA cerró la conexión.");
+          },
           onerror: (err) => {
             console.error(err);
+            addLog("Error conexión IA.");
             stopSession();
           }
         }
@@ -172,7 +200,7 @@ export default function App() {
       sessionRef.current = await sessionPromise;
       
     } catch (error: any) {
-      alert(`Error: ${error.message}`);
+      addLog("Error inicio: " + error.message);
       stopSession();
     }
   };
@@ -186,9 +214,9 @@ export default function App() {
       }
       source = mediaElementSourceRef.current;
       
-      // Creamos un control de volumen para el audio original
+      // Control de volumen para escuchar el original bajito
       const gainNode = audioCtx.createGain();
-      gainNode.gain.value = isMuted ? 0 : 0.1; // Por defecto bajito para no pisar la traducción
+      gainNode.gain.value = 0.5; // Un poco más alto para que el usuario sepa que hay sonido
       source.connect(gainNode);
       gainNode.connect(audioCtx.destination);
     } else if (stream) {
@@ -210,17 +238,20 @@ export default function App() {
       if (!sessionRef.current) return;
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Update visualizer level
+      // Monitor de nivel
       let sum = 0;
       for (let i = 0; i < inputData.length; i++) {
         sum += inputData[i] * inputData[i];
       }
-      setAudioLevel(Math.sqrt(sum / inputData.length));
+      const lvl = Math.sqrt(sum / inputData.length);
+      setAudioLevel(lvl);
 
-      const base64Data = float32ToInt16Base64(inputData);
-      sessionRef.current.sendRealtimeInput({
-        audio: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
-      });
+      if (lvl > 0.01) {
+        const base64Data = float32ToInt16Base64(inputData);
+        sessionRef.current.sendRealtimeInput({
+          audio: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
+        });
+      }
     };
   };
 
@@ -245,6 +276,9 @@ export default function App() {
 
   const playBufferedAudio = (base64Data: string) => {
     if (!audioContextRef.current) return;
+    const audioCtx = audioContextRef.current;
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
     const binary = atob(base64Data);
     const buffer = new Int16Array(binary.length / 2);
     for (let i = 0; i < buffer.length; i++) {
@@ -254,11 +288,11 @@ export default function App() {
     for (let i = 0; i < buffer.length; i++) {
         float32Buffer[i] = buffer[i] / 32768.0;
     }
-    const audioBuffer = audioContextRef.current.createBuffer(1, float32Buffer.length, SAMPLE_RATE);
+    const audioBuffer = audioCtx.createBuffer(1, float32Buffer.length, SAMPLE_RATE);
     audioBuffer.getChannelData(0).set(float32Buffer);
-    const source = audioContextRef.current.createBufferSource();
+    const source = audioCtx.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(audioContextRef.current.destination);
+    source.connect(audioCtx.destination);
     source.start();
   };
 
@@ -304,7 +338,7 @@ export default function App() {
           <video 
             ref={videoRef} 
             autoPlay={sourceType !== 'file'} 
-            muted 
+            muted={sourceType !== 'file'} 
             playsInline 
             crossOrigin="anonymous"
             className="w-full h-full object-cover"
@@ -334,12 +368,14 @@ export default function App() {
             {isActive && (
               <div className="flex items-center gap-2 px-4 py-2 bg-red-600 rounded-full text-[10px] font-black tracking-widest text-white shadow-xl">
                 <span className="w-2 h-2 bg-white rounded-full animate-pulse" />
-                EN VIVO
+                DENTRO DE LA SESIÓN
               </div>
             )}
-            <div className="px-4 py-2 bg-zinc-900/90 border border-zinc-700 rounded-full text-[10px] font-black tracking-widest text-zinc-400">
-              FUENTE: {sourceType === 'camera' ? 'CÁMARA' : sourceType === 'screen' ? 'PANTALLA' : 'ARCHIVO'}
-            </div>
+            {isAiSpeaking && (
+              <div className="flex items-center gap-2 px-4 py-2 bg-white rounded-full text-[10px] font-black tracking-widest text-black shadow-xl">
+                IA HABLANDO...
+              </div>
+            )}
           </div>
           
           {/* File Selection Overlay */}
@@ -364,6 +400,28 @@ export default function App() {
           <canvas ref={canvasRef} width={1280} height={720} className="hidden" />
         </div>
 
+        {/* Nivel de Audio / Diagnóstico */}
+        <div className="flex flex-col gap-4 bg-zinc-900/40 p-6 rounded-[32px] border border-zinc-800">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">Monitor de Audio (Video Original)</span>
+            <span className="text-[10px] font-mono text-zinc-400">{Math.round(audioLevel * 100)}%</span>
+          </div>
+          <div className="w-full h-3 bg-zinc-950 rounded-full overflow-hidden border border-zinc-800">
+            <motion.div 
+              animate={{ width: `${Math.min(100, audioLevel * 500)}%` }}
+              className={`h-full ${audioLevel > 0.01 ? 'bg-red-600' : 'bg-zinc-800'} transition-colors shadow-[0_0_10px_rgba(220,38,38,0.5)]`}
+            />
+          </div>
+          
+          {/* Debug Logs */}
+          <div className="mt-4 bg-black/60 p-4 rounded-2xl border border-zinc-800/50 font-mono text-[10px] text-zinc-500">
+            <p className="border-b border-zinc-800 pb-2 mb-2 text-zinc-400">HISTORIAL DEL SISTEMA</p>
+            {logs.map((log, i) => (
+              <p key={i} className={log.startsWith('Traducción') ? 'text-white' : ''}> {">"} {log}</p>
+            ))}
+          </div>
+        </div>
+
         {/* Controles Principales */}
         <div className="flex flex-col items-center gap-8 mt-4">
           <div className="flex flex-col md:flex-row items-center gap-6">
@@ -373,7 +431,7 @@ export default function App() {
                 className="group relative flex items-center gap-6 px-16 py-8 bg-white hover:bg-zinc-100 text-black font-black rounded-[40px] transition-all transform active:scale-95 shadow-[0_20px_60px_rgba(255,255,255,0.1)] text-2xl uppercase tracking-tighter"
               >
                 <Play className="w-10 h-10 fill-current text-red-600" />
-                COMENZAR PROCESO
+                CONECTAR IA
                 <div className="absolute -inset-1 bg-red-600 rounded-[40px] opacity-0 group-hover:opacity-20 transition-opacity blur-xl" />
               </button>
             ) : (
@@ -386,36 +444,25 @@ export default function App() {
               </button>
             )}
 
-            {sourceType === 'file' && selectedFile && !isActive && (
+            {!isAudioContextReady && (
               <button 
-                onClick={() => fileInputRef.current?.click()}
-                className="px-8 py-3 bg-zinc-800 hover:bg-zinc-700 text-white rounded-2xl text-xs font-bold font-mono transition-all"
+                onClick={initAudio}
+                className="px-8 py-3 bg-zinc-800 hover:bg-zinc-700 text-white rounded-2xl text-[10px] font-black tracking-widest transition-all"
               >
-                CAMBIAR ARCHIVO
+                HABILITAR SONIDO (CLICK OBLIGATORIO)
               </button>
             )}
-          </div>
-
-          <div className="flex items-center gap-10 opacity-30">
-            <div className="flex items-center gap-2 text-center max-w-lg">
-              <Info className="w-4 h-4 shrink-0" />
-              <span className="text-[10px] font-mono uppercase tracking-[0.2em]">
-                {sourceType === 'file' 
-                  ? "Sube tu propio archivo de video y la IA lo procesará como si fuera una transmisión en vivo."
-                  : "Ideal para YouTube, Zoom, X o cualquier contenido vía compartir pantalla."}
-              </span>
-            </div>
           </div>
         </div>
       </main>
 
       <footer className="mt-auto py-10 flex flex-col items-center gap-2 border-t border-zinc-900 w-full max-w-5xl">
         <div className="flex gap-8 text-[10px] font-mono text-zinc-600 tracking-widest uppercase">
-          <span>Latin Spanish v2.1</span>
+          <span>Latin Spanish v2.2</span>
           <span>•</span>
-          <span>File Engine Added</span>
+          <span>Fixed Audio Routing</span>
           <span>•</span>
-          <span>Latencia: ~250ms</span>
+          <span>Diagnostic Mode: ON</span>
         </div>
       </footer>
     </div>
