@@ -32,6 +32,8 @@ export default function App() {
   const [isActive, setIsActive] = useState(false);
   const [targetLang, setTargetLang] = useState(DEFAULT_TARGET_LANG);
   const [currentModelText, setCurrentModelText] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
+  const currentModelTextRef = useRef("");
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
   const [sourceType, setSourceType] = useState<SourceType>('camera');
@@ -49,6 +51,9 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isAudioContextReady, setIsAudioContextReady] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   
   const addLog = (msg: string) => {
     setLogs(prev => [msg, ...prev].slice(0, 5));
@@ -69,7 +74,8 @@ export default function App() {
     const file = e.target.files?.[0];
     if (file) {
       setSelectedFile(file);
-      setCurrentModelText("Video cargado. Presiona 'CONECTAR' botón blanco abajo.");
+      setStatusMessage("Video cargado. Presiona 'GENERAR' botón abajo.");
+      setCurrentModelText(""); // Limpiar cualquier texto previo de IA
       addLog("Archivo cargado: " + file.name);
       if (videoRef.current) {
         const url = URL.createObjectURL(file);
@@ -101,8 +107,118 @@ export default function App() {
     osc.stop(audioContextRef.current.currentTime + 0.1);
   };
 
-  const stopSession = useCallback(() => {
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedUrl, setRecordedUrl] = useState<string | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const mixedAudioDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+
+  const startRecording = (canvasStream: MediaStream, audioStream: MediaStream) => {
+    try {
+      const combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...audioStream.getAudioTracks()
+      ]);
+      
+      const recorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm' });
+      chunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        setRecordedUrl(url);
+        addLog("¡Video listo para descargar!");
+      };
+      recorder.start();
+      recorderRef.current = recorder;
+      setIsRecording(true);
+    } catch (e) {
+      addLog("Error al iniciar grabación.");
+    }
+  };
+
+  const [isConnecting, setIsConnecting] = useState(false);
+
+  // Loop de Renderizado Continuo (Preview + Recording)
+  useEffect(() => {
+    let animationId: number;
+    
+    const renderFrame = () => {
+      if (!videoRef.current || !canvasRef.current) {
+        animationId = requestAnimationFrame(renderFrame);
+        return;
+      }
+
+      const canvas = canvasRef.current;
+      const video = videoRef.current;
+      const ctx = canvas.getContext('2d');
+
+      if (ctx && (video.readyState >= 2 || video.srcObject)) {
+        // Reset state
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        
+        // 1. Dibujar el frame del video
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // 2. Si hay sesión activa y texto de IA, quemarlo
+        const textToDraw = currentModelTextRef.current;
+        if (isActive && textToDraw) {
+          const padding = 40;
+          const fontSize = 32;
+          ctx.font = `bold ${fontSize}px sans-serif`;
+          
+          const text = textToDraw.toUpperCase();
+          const textMetrics = ctx.measureText(text);
+          const boxWidth = textMetrics.width + padding * 2;
+          const boxHeight = fontSize + padding;
+          
+          const x = (canvas.width - boxWidth) / 2;
+          const y = canvas.height - 100;
+
+          // Fondo (Rectangle simple para compatibilidad)
+          ctx.fillStyle = 'white';
+          ctx.fillRect(x, y, boxWidth, boxHeight);
+          
+          // Borde
+          ctx.strokeStyle = '#dc2626';
+          ctx.lineWidth = 4;
+          ctx.strokeRect(x, y, boxWidth, boxHeight);
+
+          // Texto
+          ctx.fillStyle = 'black';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(text, canvas.width / 2, y + boxHeight / 2);
+        }
+      }
+      animationId = requestAnimationFrame(renderFrame);
+    };
+
+    renderFrame();
+    return () => cancelAnimationFrame(animationId);
+  }, [isActive]);
+
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (currentModelText) {
+      timer = setTimeout(() => {
+        setCurrentModelText("");
+        currentModelTextRef.current = "";
+      }, 5000);
+    }
+    return () => clearTimeout(timer);
+  }, [currentModelText]);
+
+  const stopSession = useCallback((reason?: string) => {
     setIsActive(false);
+    setIsConnecting(false);
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+      recorderRef.current.stop();
+    }
+    setIsRecording(false);
+    
     if (sessionRef.current) {
       sessionRef.current.close();
       sessionRef.current = null;
@@ -117,14 +233,18 @@ export default function App() {
     }
     setAudioLevel(0);
     setIsAiSpeaking(false);
-    addLog("Sesión terminada.");
+    addLog(reason ? `Fin sesión: ${reason}` : "Sesión terminada.");
   }, []);
 
   const startSession = async () => {
     try {
+      setIsConnecting(true);
+      setRecordedUrl(null);
+      setCurrentModelText(""); 
+      currentModelTextRef.current = "";
       await initAudio();
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       let stream: MediaStream | null = null;
       
       if (sourceType === 'screen') {
@@ -141,66 +261,90 @@ export default function App() {
       
       if (stream) {
         streamRef.current = stream;
-        if (videoRef.current && sourceType !== 'file') {
+        if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          await videoRef.current.play().catch(() => {});
         }
       }
+
+      const audioCtx = audioContextRef.current!;
+      mixedAudioDestRef.current = audioCtx.createMediaStreamDestination();
 
       if (sourceType === 'file' && videoRef.current) {
         videoRef.current.currentTime = 0;
         await videoRef.current.play();
       }
 
-      const audioCtx = audioContextRef.current!;
-
+      // Conexión Live Optimizada
       const sessionPromise = ai.live.connect({
-        model: "gemini-3.1-flash-live-preview",
+        model: "gemini-2.0-flash-exp", 
         config: {
-          responseModalities: [Modality.AUDIO],
+          responseModalities: [Modality.AUDIO], 
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Charon" } }
           },
-          systemInstruction: `Eres un traductor simultáneo profesional. 
-          Escucha lo que se dice en el audio y tradúcelo al ${targetLang}.
-          Responde INMEDIATAMENTE de forma hablada con la traducción.
-          Sé conciso. No expliques nada, solo traduce.`,
+          systemInstruction: `Eres un traductor simultáneo. 
+          Escucha el audio y tradúcelo al español latino. 
+          Responde solo con la traducción.`,
           outputAudioTranscription: {},
         },
         callbacks: {
           onopen: () => {
-            setIsActive(true);
-            addLog("Conexión con IA abierta.");
-            startAudioCapture(audioCtx, stream);
-            startVideoCapture();
+             setIsConnecting(false);
+             setIsActive(true);
+             addLog("IA Conectada.");
+             
+             setCurrentModelText("GRABANDO - TRADUCIENDO...");
+             currentModelTextRef.current = "GRABANDO - TRADUCIENDO...";
+             setTimeout(() => {
+               setCurrentModelText("");
+               currentModelTextRef.current = "";
+             }, 3000);
+
+             startAudioCapture(audioCtx, stream);
+             
+             const aiInterval = setInterval(() => {
+               if (sessionRef.current && canvasRef.current && isActive) {
+                 const data = canvasRef.current.toDataURL('image/jpeg', 0.4).split(',')[1];
+                 sessionRef.current.sendRealtimeInput([{
+                   inlineData: { data, mimeType: 'image/jpeg' }
+                 }]);
+               } else {
+                 clearInterval(aiInterval);
+               }
+             }, 500);
+
+             const canvasStream = canvasRef.current!.captureStream(30);
+             startRecording(canvasStream, mixedAudioDestRef.current!.stream);
           },
-          onmessage: async (message) => {
-            if (message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data) {
-              setIsAiSpeaking(true);
-              playBufferedAudio(message.serverContent.modelTurn.parts[0].inlineData.data);
-              setTimeout(() => setIsAiSpeaking(false), 2000);
-            }
-            const modelTranscription = message.serverContent?.modelTurn?.parts?.find(p => p.text)?.text;
-            if (modelTranscription) {
-               setCurrentModelText(modelTranscription);
-               addLog("Traducción: " + modelTranscription);
-            }
+          onmessage: (message: any) => {
+             const parts = message.serverContent?.modelTurn?.parts || [];
+             if (parts.length > 0) {
+               parts.forEach((part: any) => {
+                 if (part.inlineData?.data) {
+                   setIsAiSpeaking(true);
+                   playBufferedAudio(part.inlineData.data);
+                   setTimeout(() => setIsAiSpeaking(false), 2000);
+                 }
+                 if (part.text) {
+                   setCurrentModelText(part.text);
+                   currentModelTextRef.current = part.text;
+                 }
+               });
+             }
           },
-          onclose: () => {
-            setIsActive(false);
-            addLog("IA cerró la conexión.");
-          },
+          onclose: () => stopSession("Conexión cerrada"),
           onerror: (err) => {
             console.error(err);
-            addLog("Error conexión IA.");
-            stopSession();
+            stopSession(`Fallo: ${err.message || 'Desconocido'}`);
           }
         }
       });
-      
+
       sessionRef.current = await sessionPromise;
       
     } catch (error: any) {
-      addLog("Error inicio: " + error.message);
+      addLog("Error: " + error.message);
       stopSession();
     }
   };
@@ -214,11 +358,12 @@ export default function App() {
       }
       source = mediaElementSourceRef.current;
       
-      // Control de volumen para escuchar el original bajito
       const gainNode = audioCtx.createGain();
-      gainNode.gain.value = 0.5; // Un poco más alto para que el usuario sepa que hay sonido
+      gainNode.gain.value = 0.5; // Un poco más de volumen
       source.connect(gainNode);
       gainNode.connect(audioCtx.destination);
+      if (mixedAudioDestRef.current) gainNode.connect(mixedAudioDestRef.current);
+
     } else if (stream) {
       source = audioCtx.createMediaStreamSource(stream);
     } else {
@@ -235,10 +380,9 @@ export default function App() {
     processor.connect(audioCtx.destination);
 
     processor.onaudioprocess = (e) => {
-      if (!sessionRef.current) return;
+      if (!sessionRef.current || !isActive) return;
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Monitor de nivel
       let sum = 0;
       for (let i = 0; i < inputData.length; i++) {
         sum += inputData[i] * inputData[i];
@@ -246,32 +390,18 @@ export default function App() {
       const lvl = Math.sqrt(sum / inputData.length);
       setAudioLevel(lvl);
 
-      if (lvl > 0.01) {
+      // Capturar audio siempre que haya un mínimo de señal
+      if (lvl > 0.005) {
         const base64Data = float32ToInt16Base64(inputData);
-        sessionRef.current.sendRealtimeInput({
-          audio: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
-        });
+        sessionRef.current.sendRealtimeInput([{
+          inlineData: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
+        }]);
       }
     };
   };
 
   const startVideoCapture = () => {
-    const interval = setInterval(() => {
-      if (!isActive || !sessionRef.current || !videoRef.current || !canvasRef.current) {
-        if (!isActive) clearInterval(interval);
-        return;
-      }
-      const canvas = canvasRef.current;
-      const video = videoRef.current;
-      const context = canvas.getContext('2d');
-      if (context) {
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const base64Data = canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
-        sessionRef.current.sendRealtimeInput({
-          video: { data: base64Data, mimeType: 'image/jpeg' }
-        });
-      }
-    }, 1000 / FRAME_RATE);
+     // Ya manejado por el useEffect global de renderizado
   };
 
   const playBufferedAudio = (base64Data: string) => {
@@ -292,7 +422,10 @@ export default function App() {
     audioBuffer.getChannelData(0).set(float32Buffer);
     const source = audioCtx.createBufferSource();
     source.buffer = audioBuffer;
+    
+    // Salida Y Mezcla
     source.connect(audioCtx.destination);
+    if (mixedAudioDestRef.current) source.connect(mixedAudioDestRef.current);
     source.start();
   };
 
@@ -335,40 +468,71 @@ export default function App() {
       {/* Main App */}
       <main className="w-full max-w-5xl flex flex-col gap-6">
         <div className="relative aspect-video bg-zinc-900 rounded-[48px] overflow-hidden border border-zinc-800 shadow-2xl group">
+          
+          <canvas 
+            ref={canvasRef} 
+            width={1280} height={720} 
+            className="w-full h-full object-cover" 
+          />
+
           <video 
             ref={videoRef} 
-            autoPlay={sourceType !== 'file'} 
-            muted={sourceType !== 'file'} 
             playsInline 
+            muted={sourceType !== 'file'}
             crossOrigin="anonymous"
-            className="w-full h-full object-cover"
+            className="hidden" 
           />
           
           <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
 
-          {/* Subtítulos */}
-          <AnimatePresence>
-            {currentModelText && (
-              <motion.div 
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="absolute bottom-16 left-0 right-0 px-12 text-center z-50"
-              >
-                <div className="inline-block bg-white text-black px-8 py-5 rounded-[24px] shadow-[0_20px_50px_rgba(0,0,0,0.5)] border-4 border-red-600">
-                  <p className="text-2xl md:text-3xl font-black leading-tight uppercase italic tracking-tighter">
-                    {currentModelText}
+          {/* Texto de Instrucciones cuando NO está activo */}
+          {!isActive && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm p-10 text-center">
+              {isConnecting ? (
+                <div className="flex flex-col items-center gap-6">
+                  <div className="w-16 h-16 border-4 border-red-600 border-t-white rounded-full animate-spin" />
+                  <h2 className="text-xl font-bold uppercase tracking-[0.2em] animate-pulse">Conectando con la IA...</h2>
+                  <p className="text-zinc-400 text-[10px] font-mono tracking-widest uppercase">PREPARANDO GRABACIÓN</p>
+                </div>
+              ) : recordedUrl ? (
+                <div className="flex flex-col items-center gap-6">
+                  <h2 className="text-3xl font-black uppercase text-white tracking-tighter">¡Proceso Finalizado!</h2>
+                  <a 
+                    href={recordedUrl} 
+                    download="video-traducido.webm"
+                    className="px-12 py-6 bg-red-600 hover:bg-red-700 text-white font-black rounded-3xl text-xl shadow-[0_0_50px_rgba(220,38,38,0.5)] transition-all active:scale-95"
+                  >
+                    DESCARGAR VIDEO CON SUBTÍTULOS
+                  </a>
+                  <button 
+                    onClick={() => setRecordedUrl(null)}
+                    className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest hover:text-white underline underline-offset-4"
+                  >
+                    VOLVER A INTENTAR
+                  </button>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center gap-4">
+                  <div className="w-20 h-20 bg-zinc-800 rounded-3xl flex items-center justify-center mb-2 border border-zinc-700 shadow-2xl">
+                    <Play className="w-10 h-10 text-zinc-500" />
+                  </div>
+                  <p className="text-lg font-bold uppercase tracking-widest text-white drop-shadow-lg">
+                    {selectedFile ? (statusMessage || "Video Cargado y Listo") : "Sube un video para comenzar"}
+                  </p>
+                  <p className="text-[10px] font-mono text-zinc-500 tracking-[0.2em] uppercase">
+                    {selectedFile ? "PULSA EL BOTÓN BLANCO ABAJO" : "ARCHIVOS MP4 / WEBM"}
                   </p>
                 </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+              )}
+            </div>
+          )}
 
           {/* Indicadores */}
           <div className="absolute top-10 left-10 flex flex-wrap gap-3">
             {isActive && (
               <div className="flex items-center gap-2 px-4 py-2 bg-red-600 rounded-full text-[10px] font-black tracking-widest text-white shadow-xl">
                 <span className="w-2 h-2 bg-white rounded-full animate-pulse" />
-                DENTRO DE LA SESIÓN
+                GRABANDO Y TRADUCIENDO...
               </div>
             )}
             {isAiSpeaking && (
@@ -397,7 +561,6 @@ export default function App() {
             accept="video/*" 
             className="hidden" 
           />
-          <canvas ref={canvasRef} width={1280} height={720} className="hidden" />
         </div>
 
         {/* Nivel de Audio / Diagnóstico */}
@@ -431,7 +594,7 @@ export default function App() {
                 className="group relative flex items-center gap-6 px-16 py-8 bg-white hover:bg-zinc-100 text-black font-black rounded-[40px] transition-all transform active:scale-95 shadow-[0_20px_60px_rgba(255,255,255,0.1)] text-2xl uppercase tracking-tighter"
               >
                 <Play className="w-10 h-10 fill-current text-red-600" />
-                CONECTAR IA
+                GENERAR VIDEO TRADUCIDO
                 <div className="absolute -inset-1 bg-red-600 rounded-[40px] opacity-0 group-hover:opacity-20 transition-opacity blur-xl" />
               </button>
             ) : (
@@ -440,7 +603,7 @@ export default function App() {
                 className="flex items-center gap-6 px-16 py-8 bg-red-600 text-white font-black rounded-[40px] transition-all transform active:scale-95 text-2xl uppercase tracking-tighter shadow-[0_20px_60px_rgba(220,38,38,0.3)]"
               >
                 <Square className="w-10 h-10 fill-current" />
-                DETENER
+                FINALIZAR GRABACIÓN
               </button>
             )}
 
