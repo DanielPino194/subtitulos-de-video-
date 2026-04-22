@@ -44,6 +44,7 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaElementSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   
   // --- Utilidades de Audio ---
   const float32ToInt16Base64 = (buffer: Float32Array) => {
@@ -60,11 +61,14 @@ export default function App() {
     const file = e.target.files?.[0];
     if (file) {
       setSelectedFile(file);
+      setCurrentModelText("");
       if (videoRef.current) {
         const url = URL.createObjectURL(file);
-        videoRef.current.srcObject = null; // Clear stream if any
+        videoRef.current.srcObject = null; 
         videoRef.current.src = url;
         videoRef.current.load();
+        // Reset the audio source ref if we change the file
+        mediaElementSourceRef.current = null;
       }
     }
   };
@@ -75,10 +79,7 @@ export default function App() {
       sessionRef.current.close();
       sessionRef.current = null;
     }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
+    
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -105,10 +106,7 @@ export default function App() {
           alert("Por favor selecciona un archivo de video primero.");
           return;
         }
-        // Capture video frames from the video element
-        // For audio, we'll use MediaElementSourceNode in startAudioCapture
-        const video = videoRef.current;
-        await video.play();
+        await videoRef.current.play();
       } else {
         stream = await navigator.mediaDevices.getUserMedia({
           video: isCameraOn ? { width: 1280, height: 720 } : false,
@@ -123,10 +121,16 @@ export default function App() {
         }
       }
 
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
-        sampleRate: SAMPLE_RATE
-      });
-      audioContextRef.current = audioCtx;
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+          sampleRate: SAMPLE_RATE
+        });
+      }
+      
+      const audioCtx = audioContextRef.current;
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
 
       const sessionPromise = ai.live.connect({
         model: "gemini-3.1-flash-live-preview",
@@ -137,16 +141,16 @@ export default function App() {
           },
           systemInstruction: `Eres un traductor y subtitulador profesional. 
           Traduce todo el contenido que escuches o veas en el video.
-          Idioma sugerido de origen: Inglés.
+          Idioma de origen: Inglés.
           Idioma de destino: ${targetLang}.
           Responde EXCLUSIVAMENTE con la traducción en voz y el texto para subtítulos.
-          Sé extremadamente rápido y preciso. Si ves texto en el video, tradúcelo también.`,
+          IMPORTANTE: Traduce Frase por Frase de forma rápida.`,
           outputAudioTranscription: {},
         },
         callbacks: {
           onopen: () => {
             setIsActive(true);
-            if (audioCtx) startAudioCapture(audioCtx, stream);
+            startAudioCapture(audioCtx, stream);
             startVideoCapture();
           },
           onmessage: async (message) => {
@@ -159,11 +163,12 @@ export default function App() {
             }
           },
           onclose: (e) => {
-            console.log("Sesión cerrada:", e);
-            stopSession();
+            console.log("Sesión finalizada", e);
+            setIsActive(false);
           },
           onerror: (err) => {
-            console.error("Error en sesión:", err);
+            console.error("Error crítico:", err);
+            alert("Error de conexión con la IA. Reintentando...");
             stopSession();
           }
         }
@@ -171,9 +176,9 @@ export default function App() {
       
       sessionRef.current = await sessionPromise;
       
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      alert("Error al iniciar. Asegúrate de dar permisos y elegir una fuente válida.");
+      alert(`Error de inicio: ${error.message || "Revisa los permisos"}`);
       stopSession();
     }
   };
@@ -182,8 +187,14 @@ export default function App() {
     let source: AudioNode;
 
     if (sourceType === 'file' && videoRef.current) {
-      // Direct capture from video element (more reliable for files)
-      source = audioCtx.createMediaElementSource(videoRef.current);
+      if (!mediaElementSourceRef.current) {
+        mediaElementSourceRef.current = audioCtx.createMediaElementSource(videoRef.current);
+      }
+      source = mediaElementSourceRef.current;
+      // Also connect to destination so user can hear the original audio if they want
+      // or we can keep it silent and only hear the AI. 
+      // User said they want subtitles, let's keep it silent (original) but send to AI.
+      // source.connect(audioCtx.destination); 
     } else if (stream) {
       source = audioCtx.createMediaStreamSource(stream);
     } else {
@@ -192,16 +203,20 @@ export default function App() {
 
     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
     source.connect(processor);
-    // Don't connect source to destination to avoid echoing the original video audio
     processor.connect(audioCtx.destination);
 
     processor.onaudioprocess = (e) => {
-      if (!isActive || !sessionRef.current) return;
+      if (!sessionRef.current) return;
       const inputData = e.inputBuffer.getChannelData(0);
       const base64Data = float32ToInt16Base64(inputData);
-      sessionRef.current.sendRealtimeInput({
-        audio: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
-      });
+      
+      try {
+        sessionRef.current.sendRealtimeInput({
+          audio: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
+        });
+      } catch (err) {
+        console.error("Error enviando audio:", err);
+      }
     };
   };
 
