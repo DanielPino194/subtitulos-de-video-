@@ -93,7 +93,7 @@ export default function App() {
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       
-      let stream: MediaStream;
+      let stream: MediaStream | null = null;
       
       if (sourceType === 'screen') {
         stream = await (navigator.mediaDevices as any).getDisplayMedia({
@@ -105,15 +105,10 @@ export default function App() {
           alert("Por favor selecciona un archivo de video primero.");
           return;
         }
-        // Use the video element's captureStream
-        // Note: MozCaptureStream for Firefox, captureStream for Chrome
+        // Capture video frames from the video element
+        // For audio, we'll use MediaElementSourceNode in startAudioCapture
         const video = videoRef.current;
-        stream = (video as any).captureStream ? (video as any).captureStream() : (video as any).mozCaptureStream ? (video as any).mozCaptureStream() : null;
-        
-        if (!stream) {
-          throw new Error("Tu navegador no soporta la captura de video desde archivos.");
-        }
-        video.play();
+        await video.play();
       } else {
         stream = await navigator.mediaDevices.getUserMedia({
           video: isCameraOn ? { width: 1280, height: 720 } : false,
@@ -121,10 +116,11 @@ export default function App() {
         });
       }
       
-      streamRef.current = stream;
-      
-      if (videoRef.current && sourceType !== 'file') {
-        videoRef.current.srcObject = stream;
+      if (stream) {
+        streamRef.current = stream;
+        if (videoRef.current && sourceType !== 'file') {
+          videoRef.current.srcObject = stream;
+        }
       }
 
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
@@ -150,7 +146,7 @@ export default function App() {
         callbacks: {
           onopen: () => {
             setIsActive(true);
-            startAudioCapture(audioCtx, stream);
+            if (audioCtx) startAudioCapture(audioCtx, stream);
             startVideoCapture();
           },
           onmessage: async (message) => {
@@ -162,9 +158,12 @@ export default function App() {
                setCurrentModelText(modelTranscription);
             }
           },
-          onclose: () => stopSession(),
+          onclose: (e) => {
+            console.log("Sesión cerrada:", e);
+            stopSession();
+          },
           onerror: (err) => {
-            console.error(err);
+            console.error("Error en sesión:", err);
             stopSession();
           }
         }
@@ -179,16 +178,21 @@ export default function App() {
     }
   };
 
-  const startAudioCapture = async (audioCtx: AudioContext, stream: MediaStream) => {
-    // If we have an audio track, capture it
-    if (stream.getAudioTracks().length === 0 && sourceType !== 'file') {
-      console.warn("No audio track found in stream");
+  const startAudioCapture = async (audioCtx: AudioContext, stream: MediaStream | null) => {
+    let source: AudioNode;
+
+    if (sourceType === 'file' && videoRef.current) {
+      // Direct capture from video element (more reliable for files)
+      source = audioCtx.createMediaElementSource(videoRef.current);
+    } else if (stream) {
+      source = audioCtx.createMediaStreamSource(stream);
+    } else {
       return;
     }
-    
-    const source = audioCtx.createMediaStreamSource(stream);
+
     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
     source.connect(processor);
+    // Don't connect source to destination to avoid echoing the original video audio
     processor.connect(audioCtx.destination);
 
     processor.onaudioprocess = (e) => {
