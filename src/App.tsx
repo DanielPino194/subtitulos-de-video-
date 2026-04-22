@@ -4,7 +4,7 @@
  */
 
 import { useState, useRef, useEffect, useCallback, ChangeEvent } from 'react';
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality, Type } from "@google/genai";
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Mic, 
@@ -23,7 +23,8 @@ import {
 
 // --- Constantes ---
 const SAMPLE_RATE = 16000;
-const FRAME_RATE = 2; 
+const VIDEO_INTERVAL = 1000; // 1 fps para mayor estabilidad
+const VIDEO_QUALITY = 0.2;
 const DEFAULT_TARGET_LANG = 'Español Latino';
 
 type SourceType = 'camera' | 'screen' | 'file';
@@ -75,14 +76,14 @@ export default function App() {
     if (file) {
       setSelectedFile(file);
       setStatusMessage("Video cargado. Presiona 'GENERAR' botón abajo.");
-      setCurrentModelText(""); // Limpiar cualquier texto previo de IA
+      setCurrentModelText(""); 
       addLog("Archivo cargado: " + file.name);
       if (videoRef.current) {
         const url = URL.createObjectURL(file);
         videoRef.current.srcObject = null; 
         videoRef.current.src = url;
         videoRef.current.load();
-        mediaElementSourceRef.current = null;
+        // NO poner mediaElementSourceRef.current = null; para evitar error de reconexión
       }
     }
   };
@@ -177,20 +178,37 @@ export default function App() {
           const x = (canvas.width - boxWidth) / 2;
           const y = canvas.height - 100;
 
-          // Fondo (Rectangle simple para compatibilidad)
-          ctx.fillStyle = 'white';
-          ctx.fillRect(x, y, boxWidth, boxHeight);
+          // Fondo Blanco Puro
+          ctx.fillStyle = 'rgba(255, 255, 255, 1)';
+          ctx.beginPath();
+          ctx.roundRect(x, y, boxWidth, boxHeight, 10);
+          ctx.fill();
           
-          // Borde
-          ctx.strokeStyle = '#dc2626';
-          ctx.lineWidth = 4;
-          ctx.strokeRect(x, y, boxWidth, boxHeight);
+          // Borde Rojo Intenso
+          ctx.strokeStyle = '#ff0000';
+          ctx.lineWidth = 6;
+          ctx.stroke();
 
-          // Texto
+          // Texto Negro con Sombra
+          ctx.shadowColor = 'rgba(0,0,0,0.5)';
+          ctx.shadowBlur = 10;
           ctx.fillStyle = 'black';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.fillText(text, canvas.width / 2, y + boxHeight / 2);
+          ctx.shadowBlur = 0; 
+        }
+
+        // 3. Monitor de audio en tiempo real desde el analizador
+        if (analyserRef.current) {
+          const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+          analyserRef.current.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+          }
+          const avg = sum / dataArray.length;
+          setAudioLevel(avg / 128); // Normalizar a 0-1 aprox
         }
       }
       animationId = requestAnimationFrame(renderFrame);
@@ -204,9 +222,12 @@ export default function App() {
     let timer: NodeJS.Timeout;
     if (currentModelText) {
       timer = setTimeout(() => {
-        setCurrentModelText("");
-        currentModelTextRef.current = "";
-      }, 5000);
+        // Solo limpiar si es un subtítulo largo
+        if (currentModelText.length > 0) {
+          setCurrentModelText("");
+          currentModelTextRef.current = "";
+        }
+      }, 7000);
     }
     return () => clearTimeout(timer);
   }, [currentModelText]);
@@ -271,64 +292,139 @@ export default function App() {
       mixedAudioDestRef.current = audioCtx.createMediaStreamDestination();
 
       if (sourceType === 'file' && videoRef.current) {
+        // No reproducir todavía, esperar a que la IA esté lista
         videoRef.current.currentTime = 0;
-        await videoRef.current.play();
+        videoRef.current.pause();
       }
 
-      // Conexión Live Optimizada
+      // Conexión Live con el modelo correcto y herramientas de subtitulado
       const sessionPromise = ai.live.connect({
-        model: "gemini-2.0-flash-exp", 
+        model: "gemini-3.1-flash-live-preview", 
         config: {
           responseModalities: [Modality.AUDIO], 
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Charon" } }
           },
-          systemInstruction: `Eres un traductor simultáneo. 
-          Escucha el audio y tradúcelo al español latino. 
-          Responde solo con la traducción.`,
+          systemInstruction: `Eres un traductor PROFESIONAL de Inglés a Español Latino.
+TAREA:
+1. Escucha audio en Inglés.
+2. Traduce CADA PALABRA a Español Latino (Chile, Argentina, México, etc).
+3. Envía el texto traducido mediante la función 'show_subtitle'.
+4. También puedes responder con audio traducido.
+IMPORTANTE: Si no envías el texto con 'show_subtitle', el usuario no puede leer la traducción. HAZLO SIEMPRE.`,
           outputAudioTranscription: {},
+          tools: [{
+            functionDeclarations: [{
+              name: "show_subtitle",
+              description: "Muestra la traducción en pantalla como subtítulo",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  text: { type: Type.STRING, description: "La traducción al español latino" }
+                },
+                required: ["text"]
+              }
+            }]
+          }]
         },
         callbacks: {
-          onopen: () => {
-             setIsConnecting(false);
-             setIsActive(true);
-             addLog("IA Conectada.");
-             
-             setCurrentModelText("GRABANDO - TRADUCIENDO...");
-             currentModelTextRef.current = "GRABANDO - TRADUCIENDO...";
-             setTimeout(() => {
-               setCurrentModelText("");
-               currentModelTextRef.current = "";
-             }, 3000);
+          onopen: async () => {
+             try {
+               setIsConnecting(false);
+               setIsActive(true);
+               addLog("IA Conectada.");
+               
+               setCurrentModelText("SISTEMA OK - INICIANDO AUDIO...");
+               currentModelTextRef.current = "SISTEMA OK - INICIANDO AUDIO...";
+               
+               await startAudioCapture(audioCtx, stream);
 
-             startAudioCapture(audioCtx, stream);
-             
-             const aiInterval = setInterval(() => {
-               if (sessionRef.current && canvasRef.current && isActive) {
-                 const data = canvasRef.current.toDataURL('image/jpeg', 0.4).split(',')[1];
-                 sessionRef.current.sendRealtimeInput([{
-                   inlineData: { data, mimeType: 'image/jpeg' }
-                 }]);
-               } else {
-                 clearInterval(aiInterval);
+               if (sourceType === 'file' && videoRef.current) {
+                 addLog("Reproduciendo video...");
+                 videoRef.current.play().catch(e => addLog("Fallo play: " + e.message));
                }
-             }, 500);
 
-             const canvasStream = canvasRef.current!.captureStream(30);
-             startRecording(canvasStream, mixedAudioDestRef.current!.stream);
+               setTimeout(() => {
+                 if (currentModelTextRef.current === "SISTEMA OK - INICIANDO AUDIO...") {
+                   setCurrentModelText("");
+                   currentModelTextRef.current = "";
+                 }
+               }, 3000);
+
+               const aiInterval = setInterval(() => {
+                 if (sessionRef.current && canvasRef.current && isActive) {
+                   const data = canvasRef.current.toDataURL('image/jpeg', VIDEO_QUALITY).split(',')[1];
+                   sessionRef.current.sendRealtimeInput({
+                     video: { data, mimeType: 'image/jpeg' }
+                   });
+                 } else {
+                   clearInterval(aiInterval);
+                 }
+               }, VIDEO_INTERVAL);
+
+               const canvasStream = canvasRef.current!.captureStream(30);
+               startRecording(canvasStream, mixedAudioDestRef.current!.stream);
+             } catch (err) {
+               addLog("Error en arranque: " + String(err));
+             }
           },
           onmessage: (message: any) => {
-             const parts = message.serverContent?.modelTurn?.parts || [];
-             if (parts.length > 0) {
-               parts.forEach((part: any) => {
-                 if (part.inlineData?.data) {
-                   setIsAiSpeaking(true);
-                   playBufferedAudio(part.inlineData.data);
-                   setTimeout(() => setIsAiSpeaking(false), 2000);
+             // LOG PARA DEPURACIÓN: Ver si llega CUALQUIER cosa
+             if (message.serverContent) addLog("Señal IA recibida...");
+
+             // 1. Procesar transcripción si el modelo la envía
+             const transcoding = message.serverContent?.modelTurn?.parts?.find((p: any) => p.text);
+             if (transcoding) {
+               const text = transcoding.text;
+               setCurrentModelText(text);
+               currentModelTextRef.current = text;
+               addLog("T-OK: " + text.substring(0, 20));
+             }
+
+             // 2. Procesar audio
+             const audioPart = message.serverContent?.modelTurn?.parts?.find((p: any) => p.inlineData?.data);
+             if (audioPart) {
+               setIsAiSpeaking(true);
+               playBufferedAudio(audioPart.inlineData.data);
+               setTimeout(() => setIsAiSpeaking(false), 2000);
+             }
+
+             // 3. Procesar llamadas a herramientas (show_subtitle)
+             const modelTurn = message.serverContent?.modelTurn;
+             if (modelTurn?.parts) {
+               modelTurn.parts.forEach((part: any) => {
+                 if (part.functionCall && part.functionCall.name === 'show_subtitle') {
+                   const text = part.functionCall.args.text;
+                   setCurrentModelText(text);
+                   currentModelTextRef.current = text;
+                   addLog("Sub: " + text.substring(0, 30));
+                   
+                   if (sessionRef.current) {
+                     sessionRef.current.sendToolResponse({
+                       functionResponses: [{
+                         name: 'show_subtitle',
+                         response: { ok: true },
+                         id: part.functionCall.id
+                       }]
+                     });
+                   }
                  }
-                 if (part.text) {
-                   setCurrentModelText(part.text);
-                   currentModelTextRef.current = part.text;
+               });
+             }
+
+             // 4. Caso especial: ToolCall fuera de modelTurn
+             if (message.toolCall?.functionCalls) {
+               message.toolCall.functionCalls.forEach((fc: any) => {
+                 if (fc.name === 'show_subtitle') {
+                   const text = fc.args.text;
+                   setCurrentModelText(text);
+                   currentModelTextRef.current = text;
+                   addLog("ToolSub: " + text.substring(0, 30));
+                   if (sessionRef.current) {
+                     sessionRef.current.sendToolResponse({
+                       functionResponses: [{ name: 'show_subtitle', response: { ok: true }, id: fc.id }]
+                     });
+                   }
                  }
                });
              }
@@ -350,54 +446,69 @@ export default function App() {
   };
 
   const startAudioCapture = async (audioCtx: AudioContext, stream: MediaStream | null) => {
-    let source: AudioNode;
+    try {
+      const actualRate = audioCtx.sampleRate;
+      addLog(`Captura audio (${actualRate}Hz)...`);
+      let source: AudioNode;
 
-    if (sourceType === 'file' && videoRef.current) {
-      if (!mediaElementSourceRef.current) {
-        mediaElementSourceRef.current = audioCtx.createMediaElementSource(videoRef.current);
+      if (sourceType === 'file' && videoRef.current) {
+        if (!mediaElementSourceRef.current) {
+          mediaElementSourceRef.current = audioCtx.createMediaElementSource(videoRef.current);
+        }
+        source = mediaElementSourceRef.current;
+        
+        const gainNode = audioCtx.createGain();
+        gainNode.gain.value = 1.0; 
+        source.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        if (mixedAudioDestRef.current) gainNode.connect(mixedAudioDestRef.current);
+        
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        gainNode.connect(analyser); 
+        analyserRef.current = analyser;
+
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        gainNode.connect(processor); 
+        processor.connect(audioCtx.destination);
+        
+        processor.onaudioprocess = (e) => {
+          if (!sessionRef.current || !isActive) return;
+          const inputData = e.inputBuffer.getChannelData(0);
+          
+          // Enviar siempre a la IA
+          const base64Data = float32ToInt16Base64(inputData);
+          sessionRef.current.sendRealtimeInput({
+            audio: { data: base64Data, mimeType: `audio/pcm;rate=${actualRate}` }
+          });
+        };
+        addLog("Audio de archivo OK.");
+      } else if (stream) {
+        source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        analyserRef.current = analyser;
+
+        if (mixedAudioDestRef.current) source.connect(mixedAudioDestRef.current);
+
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+
+        processor.onaudioprocess = (e) => {
+          if (!sessionRef.current || !isActive) return;
+          const inputData = e.inputBuffer.getChannelData(0);
+          const base64Data = float32ToInt16Base64(inputData);
+          sessionRef.current.sendRealtimeInput({
+            audio: { data: base64Data, mimeType: `audio/pcm;rate=${actualRate}` }
+          });
+        };
+        addLog("Audio micro OK.");
       }
-      source = mediaElementSourceRef.current;
-      
-      const gainNode = audioCtx.createGain();
-      gainNode.gain.value = 0.5; // Un poco más de volumen
-      source.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-      if (mixedAudioDestRef.current) gainNode.connect(mixedAudioDestRef.current);
-
-    } else if (stream) {
-      source = audioCtx.createMediaStreamSource(stream);
-    } else {
-      return;
+    } catch (err) {
+      addLog("ERROR AUDIO: " + String(err));
     }
-
-    const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(analyser);
-    analyserRef.current = analyser;
-
-    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-
-    processor.onaudioprocess = (e) => {
-      if (!sessionRef.current || !isActive) return;
-      const inputData = e.inputBuffer.getChannelData(0);
-      
-      let sum = 0;
-      for (let i = 0; i < inputData.length; i++) {
-        sum += inputData[i] * inputData[i];
-      }
-      const lvl = Math.sqrt(sum / inputData.length);
-      setAudioLevel(lvl);
-
-      // Capturar audio siempre que haya un mínimo de señal
-      if (lvl > 0.005) {
-        const base64Data = float32ToInt16Base64(inputData);
-        sessionRef.current.sendRealtimeInput([{
-          inlineData: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
-        }]);
-      }
-    };
   };
 
   const startVideoCapture = () => {
@@ -480,7 +591,7 @@ export default function App() {
             playsInline 
             muted={sourceType !== 'file'}
             crossOrigin="anonymous"
-            className="hidden" 
+            className="fixed top-[-1000px] left-[-1000px] w-1 h-1 opacity-0 pointer-events-none" 
           />
           
           <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
@@ -537,11 +648,20 @@ export default function App() {
             )}
             {isAiSpeaking && (
               <div className="flex items-center gap-2 px-4 py-2 bg-white rounded-full text-[10px] font-black tracking-widest text-black shadow-xl">
-                IA HABLANDO...
+                <span className="w-2 h-2 bg-black rounded-full animate-bounce" />
+                IA TRADUCIENDO...
               </div>
             )}
           </div>
-          
+
+          {/* SUBTÍTULOS DE EMERGENCIA (FUERA DEL CANVAS PARA DEPURACIÓN) */}
+          {isActive && currentModelText && (
+            <div className="absolute bottom-28 left-10 right-10 flex justify-center pointer-events-none z-50">
+              <div className="bg-black/90 text-white px-8 py-4 rounded-2xl border-2 border-red-600 font-bold text-center text-xl shadow-2xl animate-in fade-in slide-in-from-bottom-5">
+                {currentModelText}
+              </div>
+            </div>
+          )}
           {/* File Selection Overlay */}
           {sourceType === 'file' && !selectedFile && (
             <div 
