@@ -46,6 +46,10 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaElementSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   
+  const [isMuted, setIsMuted] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  
   // --- Utilidades de Audio ---
   const float32ToInt16Base64 = (buffer: Float32Array) => {
     const int16Buffer = new Int16Array(buffer.length);
@@ -61,13 +65,12 @@ export default function App() {
     const file = e.target.files?.[0];
     if (file) {
       setSelectedFile(file);
-      setCurrentModelText("");
+      setCurrentModelText("Video cargado. Presiona 'COMENZAR' para traducir.");
       if (videoRef.current) {
         const url = URL.createObjectURL(file);
         videoRef.current.srcObject = null; 
         videoRef.current.src = url;
         videoRef.current.load();
-        // Reset the audio source ref if we change the file
         mediaElementSourceRef.current = null;
       }
     }
@@ -84,11 +87,11 @@ export default function App() {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
-    if (videoRef.current && sourceType === 'file') {
+    if (videoRef.current) {
       videoRef.current.pause();
     }
-    setCurrentModelText("");
-  }, [sourceType]);
+    setAudioLevel(0);
+  }, []);
 
   const startSession = async () => {
     try {
@@ -101,13 +104,7 @@ export default function App() {
           video: { cursor: "always" },
           audio: true 
         });
-      } else if (sourceType === 'file') {
-        if (!selectedFile || !videoRef.current) {
-          alert("Por favor selecciona un archivo de video primero.");
-          return;
-        }
-        await videoRef.current.play();
-      } else {
+      } else if (sourceType === 'camera') {
         stream = await navigator.mediaDevices.getUserMedia({
           video: isCameraOn ? { width: 1280, height: 720 } : false,
           audio: isMicOn
@@ -119,6 +116,10 @@ export default function App() {
         if (videoRef.current && sourceType !== 'file') {
           videoRef.current.srcObject = stream;
         }
+      }
+
+      if (sourceType === 'file' && videoRef.current) {
+        await videoRef.current.play();
       }
 
       if (!audioContextRef.current) {
@@ -139,12 +140,10 @@ export default function App() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Charon" } }
           },
-          systemInstruction: `Eres un traductor y subtitulador profesional. 
-          Traduce todo el contenido que escuches o veas en el video.
-          Idioma de origen: Inglés.
-          Idioma de destino: ${targetLang}.
-          Responde EXCLUSIVAMENTE con la traducción en voz y el texto para subtítulos.
-          IMPORTANTE: Traduce Frase por Frase de forma rápida.`,
+          systemInstruction: `Eres un traductor profesional EN VIVO. 
+          Traduce todo el audio que recibas al ${targetLang}.
+          Salida: Audio Traducido + Texto de la traducción.
+          Sé extremadamente rápido. Responde frase por frase.`,
           outputAudioTranscription: {},
         },
         callbacks: {
@@ -162,13 +161,9 @@ export default function App() {
                setCurrentModelText(modelTranscription);
             }
           },
-          onclose: (e) => {
-            console.log("Sesión finalizada", e);
-            setIsActive(false);
-          },
+          onclose: () => setIsActive(false),
           onerror: (err) => {
-            console.error("Error crítico:", err);
-            alert("Error de conexión con la IA. Reintentando...");
+            console.error(err);
             stopSession();
           }
         }
@@ -177,8 +172,7 @@ export default function App() {
       sessionRef.current = await sessionPromise;
       
     } catch (error: any) {
-      console.error(error);
-      alert(`Error de inicio: ${error.message || "Revisa los permisos"}`);
+      alert(`Error: ${error.message}`);
       stopSession();
     }
   };
@@ -191,15 +185,22 @@ export default function App() {
         mediaElementSourceRef.current = audioCtx.createMediaElementSource(videoRef.current);
       }
       source = mediaElementSourceRef.current;
-      // Also connect to destination so user can hear the original audio if they want
-      // or we can keep it silent and only hear the AI. 
-      // User said they want subtitles, let's keep it silent (original) but send to AI.
-      // source.connect(audioCtx.destination); 
+      
+      // Creamos un control de volumen para el audio original
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = isMuted ? 0 : 0.1; // Por defecto bajito para no pisar la traducción
+      source.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
     } else if (stream) {
       source = audioCtx.createMediaStreamSource(stream);
     } else {
       return;
     }
+
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    analyserRef.current = analyser;
 
     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
     source.connect(processor);
@@ -208,15 +209,18 @@ export default function App() {
     processor.onaudioprocess = (e) => {
       if (!sessionRef.current) return;
       const inputData = e.inputBuffer.getChannelData(0);
-      const base64Data = float32ToInt16Base64(inputData);
       
-      try {
-        sessionRef.current.sendRealtimeInput({
-          audio: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
-        });
-      } catch (err) {
-        console.error("Error enviando audio:", err);
+      // Update visualizer level
+      let sum = 0;
+      for (let i = 0; i < inputData.length; i++) {
+        sum += inputData[i] * inputData[i];
       }
+      setAudioLevel(Math.sqrt(sum / inputData.length));
+
+      const base64Data = float32ToInt16Base64(inputData);
+      sessionRef.current.sendRealtimeInput({
+        audio: { data: base64Data, mimeType: `audio/pcm;rate=${SAMPLE_RATE}` }
+      });
     };
   };
 
